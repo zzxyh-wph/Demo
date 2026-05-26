@@ -85,7 +85,7 @@ public class DbSyncApplicationRunner implements ApplicationRunner {
                 "dbsync commands:",
                 "  generate --url=... --username=... [--password=...|--passwordEnv=ENV] [--schema=...] [--outputDir=./dbsync]",
                 "  diff --baselineSnapshot=./dbsync/baseline/snapshot.json --prodUrl=... --prodUsername=... [--prodPassword=...|--prodPasswordEnv=ENV] [--prodSchema=...] [--outputDir=./dbsync]",
-                "  apply --changelog=./dbsync/diff/<ts>/diff.changelog.xml --prodUrl=... --prodUsername=... [--prodPassword=...|--prodPasswordEnv=ENV] [--prodSchema=...] [--outputDir=./dbsync]",
+                "  apply --changelog=./dbsync/diff/<ts>/diff.changelog.yaml --prodUrl=... --prodUsername=... [--prodPassword=...|--prodPasswordEnv=ENV] [--prodSchema=...] [--outputDir=./dbsync]",
                 ""
         );
         System.out.println(msg);

@@ -52,7 +52,7 @@ public class LiquibaseDbSyncService {
         Files.createDirectories(baselineDir);
 
         Path snapshotFile = baselineDir.resolve("snapshot.json");
-        Path baselineChangelog = baselineDir.resolve("baseline.changelog.xml");
+        Path baselineChangelog = baselineDir.resolve("baseline.changelog.yaml");
         Path baselineSql = baselineDir.resolve("baseline.sql");
 
         Database sourceDb = openJdbcDatabase(source);
@@ -75,7 +75,7 @@ public class LiquibaseDbSyncService {
         Path diffDir = outputDir.resolve("diff").resolve(LocalDateTime.now().format(TS));
         Files.createDirectories(diffDir);
 
-        Path diffChangelog = diffDir.resolve("diff.changelog.xml");
+        Path diffChangelog = diffDir.resolve("diff.changelog.yaml");
         Path diffSql = diffDir.resolve("diff.sql");
 
         ResourceAccessor resourceAccessor = new CompositeResourceAccessor(
