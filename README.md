@@ -36,6 +36,7 @@ curl -X POST "http://127.0.0.1:8080/dbsync/updateTables?approved=true&date=20260
 - 按 SQL 语句逐条执行
 - 单条语句失败会在 `./dbsync/apply-sql/<yyyyMMdd-HHmmss>/logs/` 下生成对应 `stmt-XXXX.log`
 - 失败会跳过继续后续语句执行
+- 每条语句会写入执行日志表 `dbsync_update_log`（含 tablename、old_sql、execute_sql、更新时间、状态、异常说明）
 
 ## 打包
 

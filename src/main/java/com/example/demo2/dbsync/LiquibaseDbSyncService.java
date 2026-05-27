@@ -46,11 +46,19 @@ import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 @Service
 public class LiquibaseDbSyncService {
     private static final DateTimeFormatter TS = DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss");
     private static final DateTimeFormatter DAY = DateTimeFormatter.ofPattern("yyyyMMdd");
+    private static final String UPDATE_LOG_TABLE = "dbsync_update_log";
+
+    private static final Pattern ALTER_TABLE_PATTERN = Pattern.compile("(?i)\\balter\\s+table\\s+`?([a-zA-Z0-9_]+)`?");
+    private static final Pattern CREATE_TABLE_PATTERN = Pattern.compile("(?i)\\bcreate\\s+table\\s+`?([a-zA-Z0-9_]+)`?");
+    private static final Pattern DROP_TABLE_PATTERN = Pattern.compile("(?i)\\bdrop\\s+table\\s+`?([a-zA-Z0-9_]+)`?");
+    private static final Pattern COLUMN_PATTERN = Pattern.compile("(?i)\\b(add\\s+column|add|modify\\s+column|modify|change\\s+column|change|drop\\s+column|drop)\\s+`?([a-zA-Z0-9_]+)`?(?:\\s+`?([a-zA-Z0-9_]+)`?)?");
 
     public BaselineFiles generateBaseline(DbConnectionInfo source, Path outputDir) throws Exception {
         Path baselineDir = outputDir.resolve("baseline");
@@ -179,6 +187,7 @@ public class LiquibaseDbSyncService {
 
         try (Connection connection = DriverManager.getConnection(prod.getUrl(), prod.getUsername(), prod.getPassword())) {
             connection.setAutoCommit(true);
+            ensureUpdateLogTable(connection);
             for (int i = 0; i < statements.size(); i++) {
                 String statement = statements.get(i).trim();
                 if (statement.isEmpty()) {
@@ -186,17 +195,21 @@ public class LiquibaseDbSyncService {
                 }
                 String idx = String.format("%04d", i + 1);
                 Path logFile = logsDir.resolve("stmt-" + idx + ".log");
+                String tableName = parseTableName(statement);
+                String oldSql = tryGetOldColumnSql(connection, statement, tableName);
                 try (Statement st = connection.createStatement()) {
                     st.execute(statement);
                     success++;
+                    insertUpdateLog(connection, tableName, oldSql, statement, 1, null);
                 } catch (SQLException e) {
                     failed++;
                     Files.writeString(logFile, statement + "\n\n" + e.getClass().getName() + ": " + e.getMessage() + "\n", StandardCharsets.UTF_8);
+                    insertUpdateLog(connection, tableName, oldSql, statement, 0, e.getMessage());
                 }
             }
         }
 
-        return new SqlApplyResult(applyDir, logsDir, statements.size(), success, failed);
+        return new SqlApplyResult(applyDir, logsDir, statements.size(), success, failed, UPDATE_LOG_TABLE);
     }
 
     public ApplyResult applyChangelogIndividually(Path changelogFile, DbConnectionInfo prod, Path outputDir) throws Exception {
@@ -407,6 +420,116 @@ public class LiquibaseDbSyncService {
         return statements;
     }
 
+    private static void ensureUpdateLogTable(Connection connection) throws SQLException {
+        String ddl = "CREATE TABLE IF NOT EXISTS " + UPDATE_LOG_TABLE + " ("
+                + "logid BIGINT AUTO_INCREMENT PRIMARY KEY,"
+                + "tablename VARCHAR(256) NOT NULL DEFAULT '',"
+                + "old_sql TEXT NULL,"
+                + "execute_sql TEXT NOT NULL,"
+                + "`update` DATETIME NOT NULL,"
+                + "status TINYINT NOT NULL,"
+                + "message TEXT NULL"
+                + ") ENGINE=InnoDB";
+        try (Statement st = connection.createStatement()) {
+            st.execute(ddl);
+        }
+    }
+
+    private static void insertUpdateLog(Connection connection,
+                                        String tableName,
+                                        String oldSql,
+                                        String executeSql,
+                                        int status,
+                                        String message) throws SQLException {
+        String safeTable = tableName == null ? "" : tableName;
+        String safeOld = oldSql;
+        String safeMsg = message;
+        String sql = "INSERT INTO " + UPDATE_LOG_TABLE + " (tablename, old_sql, execute_sql, `update`, status, message) "
+                + "VALUES (?, ?, ?, NOW(), ?, ?)";
+        try (var ps = connection.prepareStatement(sql)) {
+            ps.setString(1, safeTable);
+            ps.setString(2, safeOld);
+            ps.setString(3, executeSql);
+            ps.setInt(4, status);
+            ps.setString(5, safeMsg);
+            ps.executeUpdate();
+        }
+    }
+
+    private static String parseTableName(String statement) {
+        Matcher m1 = ALTER_TABLE_PATTERN.matcher(statement);
+        if (m1.find()) {
+            return m1.group(1);
+        }
+        Matcher m2 = CREATE_TABLE_PATTERN.matcher(statement);
+        if (m2.find()) {
+            return m2.group(1);
+        }
+        Matcher m3 = DROP_TABLE_PATTERN.matcher(statement);
+        if (m3.find()) {
+            return m3.group(1);
+        }
+        return "";
+    }
+
+    private static String tryGetOldColumnSql(Connection connection, String statement, String tableName) {
+        if (tableName == null || tableName.isBlank()) {
+            return null;
+        }
+        Matcher m = COLUMN_PATTERN.matcher(statement);
+        if (!m.find()) {
+            return null;
+        }
+
+        String op = m.group(1).toLowerCase();
+        String col1 = m.group(2);
+
+        String targetCol;
+        if (op.startsWith("change")) {
+            targetCol = col1;
+        } else if (op.startsWith("drop")) {
+            targetCol = col1;
+        } else if (op.startsWith("modify")) {
+            targetCol = col1;
+        } else {
+            return null;
+        }
+
+        String query = "SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_DEFAULT, EXTRA "
+                + "FROM INFORMATION_SCHEMA.COLUMNS "
+                + "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ?";
+        try (var ps = connection.prepareStatement(query)) {
+            ps.setString(1, tableName);
+            ps.setString(2, targetCol);
+            try (var rs = ps.executeQuery()) {
+                if (!rs.next()) {
+                    return null;
+                }
+                String columnType = rs.getString("COLUMN_TYPE");
+                String isNullable = rs.getString("IS_NULLABLE");
+                String columnDefault = rs.getString("COLUMN_DEFAULT");
+                String extra = rs.getString("EXTRA");
+
+                StringBuilder sb = new StringBuilder();
+                sb.append("`").append(targetCol).append("` ").append(columnType);
+                if ("NO".equalsIgnoreCase(isNullable)) {
+                    sb.append(" NOT NULL");
+                } else {
+                    sb.append(" NULL");
+                }
+                if (columnDefault != null) {
+                    sb.append(" DEFAULT '").append(columnDefault.replace("'", "''")).append("'");
+                }
+                if (extra != null && !extra.isBlank()) {
+                    sb.append(" ").append(extra);
+                }
+                return sb.toString();
+            }
+        } catch (SQLException e) {
+            return null;
+        }
+    }
+
     private static class NoopChangeExecListener implements ChangeExecListener {
         @Override
         public void willRun(ChangeSet changeSet, liquibase.changelog.DatabaseChangeLog databaseChangeLog, Database database, ChangeSet.RunStatus runStatus) {
@@ -599,13 +722,15 @@ public class LiquibaseDbSyncService {
         private final int total;
         private final int success;
         private final int failed;
+        private final String logTable;
 
-        public SqlApplyResult(Path applyDir, Path logsDir, int total, int success, int failed) {
+        public SqlApplyResult(Path applyDir, Path logsDir, int total, int success, int failed, String logTable) {
             this.applyDir = applyDir;
             this.logsDir = logsDir;
             this.total = total;
             this.success = success;
             this.failed = failed;
+            this.logTable = logTable;
         }
 
         public Path getApplyDir() {
@@ -626,6 +751,10 @@ public class LiquibaseDbSyncService {
 
         public int getFailed() {
             return failed;
+        }
+
+        public String getLogTable() {
+            return logTable;
         }
     }
 }

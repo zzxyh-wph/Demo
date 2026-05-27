@@ -71,6 +71,7 @@ public class DbSyncController {
         body.put("sqlFile", sqlFile.toString());
         body.put("applyDir", result.getApplyDir().toString());
         body.put("logsDir", result.getLogsDir().toString());
+        body.put("logTable", result.getLogTable());
         body.put("total", result.getTotal());
         body.put("success", result.getSuccess());
         body.put("failed", result.getFailed());
