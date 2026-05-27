@@ -1,10 +1,41 @@
 # dbsync（Spring Boot 2.7.x + Liquibase）
 
-面向“已有数据库”的结构同步工具后端项目（命令行 Jar）。主要用于：
+面向“已有数据库”的结构同步工具后端项目（命令行 Jar + HTTP）。主要用于：
 
 1. 连接指定数据库，导出完整库表结构的 SQL（baseline.sql）
 2. 发版到生产后，用 baseline 的快照与生产库对比，生成 Liquibase changelog（diff.changelog.yaml）
 3. 逐 changeSet 执行更新，单个 changeSet 异常单独落日志文件，且不中断整体执行
+
+## 推荐流程（生成→人工审阅→批准→执行）
+
+### 1) 部署后生成脚本（diffTables）
+
+调用接口会做两件事：
+
+- 从标准库生成/覆盖 `./dbsync/update.sql`（完整库表脚本）
+- 与生产库对比生成当天的差异脚本 `./dbsync/diff/<yyyyMMdd>/diff-<yyyyMMdd>.sql`（默认仅输出 columns 类型差异，可通过 dbsync.diffTypes 调整）
+
+```bash
+curl -X POST http://127.0.0.1:8080/dbsync/diffTables
+```
+
+### 2) 人工审阅
+
+人工审阅并确认 `diff-<yyyyMMdd>.sql`。
+
+- 也可以选择手工执行该 SQL（不通过接口执行）
+
+### 3) 审核后执行（updateTables）
+
+```bash
+curl -X POST "http://127.0.0.1:8080/dbsync/updateTables?approved=true&date=20260526"
+```
+
+执行特性：
+
+- 按 SQL 语句逐条执行
+- 单条语句失败会在 `./dbsync/apply-sql/<yyyyMMdd-HHmmss>/logs/` 下生成对应 `stmt-XXXX.log`
+- 失败会跳过继续后续语句执行
 
 ## 打包
 
@@ -67,6 +98,13 @@ java -jar target/demo2-0.0.1-SNAPSHOT.jar apply \
 - 逐 changeSet 执行
 - 单 changeSet 失败会在 `./dbsync/apply/<yyyyMMdd-HHmmss>/logs/` 下生成对应 `.log`
 - 失败不会中断后续 changeSet 的执行
+
+## 配置（application.yml）
+
+需要在 `application.yml` 中配置标准库与生产库连接（建议使用环境变量注入密码）：
+
+- `dbsync.standard.*`
+- `dbsync.production.*`
 
 ## 依赖与约束
 

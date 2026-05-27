@@ -39,13 +39,18 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.sql.Connection;
 import java.sql.DriverManager;
+import java.sql.SQLException;
+import java.sql.Statement;
+import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
 import java.util.List;
 
 @Service
 public class LiquibaseDbSyncService {
     private static final DateTimeFormatter TS = DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss");
+    private static final DateTimeFormatter DAY = DateTimeFormatter.ofPattern("yyyyMMdd");
 
     public BaselineFiles generateBaseline(DbConnectionInfo source, Path outputDir) throws Exception {
         Path baselineDir = outputDir.resolve("baseline");
@@ -69,6 +74,63 @@ public class LiquibaseDbSyncService {
         writeSqlFromChangelog(baselineChangelog, baselineSql, "offline:mysql");
 
         return new BaselineFiles(baselineDir, snapshotFile, baselineChangelog, baselineSql);
+    }
+
+    public StandardUpdateFiles generateStandardUpdateSql(DbConnectionInfo standard, Path outputDir) throws Exception {
+        Files.createDirectories(outputDir);
+
+        Path standardDir = outputDir.resolve("standard");
+        Files.createDirectories(standardDir);
+
+        Path snapshotFile = standardDir.resolve("snapshot.json");
+        Path changelogFile = standardDir.resolve("standard.changelog.yaml");
+        Path updateSqlFile = outputDir.resolve("update.sql");
+
+        Database sourceDb = openJdbcDatabase(standard);
+        try {
+            writeSnapshot(sourceDb, snapshotFile);
+            writeGenerateChangelog(sourceDb, changelogFile);
+        } finally {
+            try {
+                sourceDb.close();
+            } catch (Exception ignored) {
+            }
+        }
+
+        writeSqlFromChangelog(changelogFile, updateSqlFile, "offline:mysql");
+        return new StandardUpdateFiles(standardDir, snapshotFile, changelogFile, updateSqlFile);
+    }
+
+    public DiffSqlFiles diffTablesToSql(Path standardSnapshotFile, DbConnectionInfo prod, String diffTypes, Path outputDir) throws Exception {
+        String day = LocalDate.now().format(DAY);
+        Path dayDir = outputDir.resolve("diff").resolve(day);
+        Files.createDirectories(dayDir);
+
+        Path diffChangelog = dayDir.resolve("diff.changelog.yaml");
+        Path diffSql = dayDir.resolve("diff-" + day + ".sql");
+
+        ResourceAccessor resourceAccessor = new CompositeResourceAccessor(
+                new FileSystemResourceAccessor(standardSnapshotFile.getParent().toFile()),
+                new ClassLoaderResourceAccessor()
+        );
+        Database referenceDb = openOfflineSnapshotDatabase(standardSnapshotFile, resourceAccessor);
+
+        Database prodDb = openJdbcDatabase(prod);
+        try {
+            writeDiffChangelog(referenceDb, prodDb, diffChangelog, diffTypes);
+        } finally {
+            try {
+                referenceDb.close();
+            } catch (Exception ignored) {
+            }
+            try {
+                prodDb.close();
+            } catch (Exception ignored) {
+            }
+        }
+
+        writeSqlFromChangelog(diffChangelog, diffSql, prod.getUrl(), prod.getUsername(), prod.getPassword(), prod.getDefaultSchema());
+        return new DiffSqlFiles(dayDir, diffChangelog, diffSql);
     }
 
     public DiffFiles diffWithProduction(Path baselineSnapshotFile, DbConnectionInfo prod, Path outputDir) throws Exception {
@@ -101,6 +163,40 @@ public class LiquibaseDbSyncService {
         writeSqlFromChangelog(diffChangelog, diffSql, prod.getUrl(), prod.getUsername(), prod.getPassword(), prod.getDefaultSchema());
 
         return new DiffFiles(diffDir, diffChangelog, diffSql);
+    }
+
+    public SqlApplyResult applySqlFile(DbConnectionInfo prod, Path sqlFile, Path outputDir) throws Exception {
+        String ts = LocalDateTime.now().format(TS);
+        Path applyDir = outputDir.resolve("apply-sql").resolve(ts);
+        Path logsDir = applyDir.resolve("logs");
+        Files.createDirectories(logsDir);
+
+        String content = Files.readString(sqlFile, StandardCharsets.UTF_8);
+        List<String> statements = splitStatements(content);
+
+        int success = 0;
+        int failed = 0;
+
+        try (Connection connection = DriverManager.getConnection(prod.getUrl(), prod.getUsername(), prod.getPassword())) {
+            connection.setAutoCommit(true);
+            for (int i = 0; i < statements.size(); i++) {
+                String statement = statements.get(i).trim();
+                if (statement.isEmpty()) {
+                    continue;
+                }
+                String idx = String.format("%04d", i + 1);
+                Path logFile = logsDir.resolve("stmt-" + idx + ".log");
+                try (Statement st = connection.createStatement()) {
+                    st.execute(statement);
+                    success++;
+                } catch (SQLException e) {
+                    failed++;
+                    Files.writeString(logFile, statement + "\n\n" + e.getClass().getName() + ": " + e.getMessage() + "\n", StandardCharsets.UTF_8);
+                }
+            }
+        }
+
+        return new SqlApplyResult(applyDir, logsDir, statements.size(), success, failed);
     }
 
     public ApplyResult applyChangelogIndividually(Path changelogFile, DbConnectionInfo prod, Path outputDir) throws Exception {
@@ -184,12 +280,16 @@ public class LiquibaseDbSyncService {
         CommandLineUtils.doGenerateChangeLog(changelogFile.toString(), database, schemas, null, "dbsync (generated)", null, null, diffOutputControl);
     }
 
-    private void writeDiffChangelog(Database referenceDb, Database prodDb, Path diffChangelog) throws Exception {
+    private void writeDiffChangelog(Database referenceDb, Database prodDb, Path diffChangelog, String diffTypes) throws Exception {
         CompareControl.SchemaComparison[] schemaComparisons = new CompareControl.SchemaComparison[]{
                 new CompareControl.SchemaComparison(referenceDb.getDefaultSchema(), prodDb.getDefaultSchema())
         };
         DiffOutputControl diffOutputControl = new DiffOutputControl(false, false, false, schemaComparisons);
-        CommandLineUtils.doDiffToChangeLog(diffChangelog.toString(), referenceDb, prodDb, diffOutputControl, null, null, schemaComparisons);
+        CommandLineUtils.doDiffToChangeLog(diffChangelog.toString(), referenceDb, prodDb, diffOutputControl, null, diffTypes, schemaComparisons);
+    }
+
+    private void writeDiffChangelog(Database referenceDb, Database prodDb, Path diffChangelog) throws Exception {
+        writeDiffChangelog(referenceDb, prodDb, diffChangelog, null);
     }
 
     private void writeSqlFromChangelog(Path changelogFile, Path outputSqlFile, String offlineUrl) throws Exception {
@@ -233,6 +333,78 @@ public class LiquibaseDbSyncService {
 
     private static String safeFileName(String s) {
         return s.replaceAll("[^a-zA-Z0-9._-]", "_");
+    }
+
+    private static List<String> splitStatements(String sql) {
+        List<String> statements = new ArrayList<>();
+        StringBuilder current = new StringBuilder();
+
+        boolean inSingleQuote = false;
+        boolean inDoubleQuote = false;
+        boolean inLineComment = false;
+        boolean inBlockComment = false;
+
+        for (int i = 0; i < sql.length(); i++) {
+            char c = sql.charAt(i);
+            char next = (i + 1 < sql.length()) ? sql.charAt(i + 1) : '\0';
+
+            if (inLineComment) {
+                if (c == '\n') {
+                    inLineComment = false;
+                }
+                current.append(c);
+                continue;
+            }
+
+            if (inBlockComment) {
+                current.append(c);
+                if (c == '*' && next == '/') {
+                    current.append(next);
+                    i++;
+                    inBlockComment = false;
+                }
+                continue;
+            }
+
+            if (!inSingleQuote && !inDoubleQuote) {
+                if (c == '-' && next == '-') {
+                    inLineComment = true;
+                    current.append(c).append(next);
+                    i++;
+                    continue;
+                }
+                if (c == '/' && next == '*') {
+                    inBlockComment = true;
+                    current.append(c).append(next);
+                    i++;
+                    continue;
+                }
+            }
+
+            if (c == '\'' && !inDoubleQuote) {
+                inSingleQuote = !inSingleQuote;
+                current.append(c);
+                continue;
+            }
+            if (c == '"' && !inSingleQuote) {
+                inDoubleQuote = !inDoubleQuote;
+                current.append(c);
+                continue;
+            }
+
+            if (c == ';' && !inSingleQuote && !inDoubleQuote) {
+                statements.add(current.toString());
+                current.setLength(0);
+                continue;
+            }
+
+            current.append(c);
+        }
+
+        if (current.length() > 0) {
+            statements.add(current.toString());
+        }
+        return statements;
     }
 
     private static class NoopChangeExecListener implements ChangeExecListener {
@@ -339,6 +511,96 @@ public class LiquibaseDbSyncService {
         private final int failed;
 
         public ApplyResult(Path applyDir, Path logsDir, int total, int success, int failed) {
+            this.applyDir = applyDir;
+            this.logsDir = logsDir;
+            this.total = total;
+            this.success = success;
+            this.failed = failed;
+        }
+
+        public Path getApplyDir() {
+            return applyDir;
+        }
+
+        public Path getLogsDir() {
+            return logsDir;
+        }
+
+        public int getTotal() {
+            return total;
+        }
+
+        public int getSuccess() {
+            return success;
+        }
+
+        public int getFailed() {
+            return failed;
+        }
+    }
+
+    public static class StandardUpdateFiles {
+        private final Path standardDir;
+        private final Path snapshotFile;
+        private final Path changelogFile;
+        private final Path updateSqlFile;
+
+        public StandardUpdateFiles(Path standardDir, Path snapshotFile, Path changelogFile, Path updateSqlFile) {
+            this.standardDir = standardDir;
+            this.snapshotFile = snapshotFile;
+            this.changelogFile = changelogFile;
+            this.updateSqlFile = updateSqlFile;
+        }
+
+        public Path getStandardDir() {
+            return standardDir;
+        }
+
+        public Path getSnapshotFile() {
+            return snapshotFile;
+        }
+
+        public Path getChangelogFile() {
+            return changelogFile;
+        }
+
+        public Path getUpdateSqlFile() {
+            return updateSqlFile;
+        }
+    }
+
+    public static class DiffSqlFiles {
+        private final Path diffDir;
+        private final Path changelogFile;
+        private final Path diffSqlFile;
+
+        public DiffSqlFiles(Path diffDir, Path changelogFile, Path diffSqlFile) {
+            this.diffDir = diffDir;
+            this.changelogFile = changelogFile;
+            this.diffSqlFile = diffSqlFile;
+        }
+
+        public Path getDiffDir() {
+            return diffDir;
+        }
+
+        public Path getChangelogFile() {
+            return changelogFile;
+        }
+
+        public Path getDiffSqlFile() {
+            return diffSqlFile;
+        }
+    }
+
+    public static class SqlApplyResult {
+        private final Path applyDir;
+        private final Path logsDir;
+        private final int total;
+        private final int success;
+        private final int failed;
+
+        public SqlApplyResult(Path applyDir, Path logsDir, int total, int success, int failed) {
             this.applyDir = applyDir;
             this.logsDir = logsDir;
             this.total = total;

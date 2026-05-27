@@ -20,7 +20,10 @@ public class DbSyncApplicationRunner implements ApplicationRunner {
     public void run(ApplicationArguments args) {
         try {
             List<String> nonOptionArgs = args.getNonOptionArgs();
-            if (nonOptionArgs.isEmpty() || "help".equalsIgnoreCase(nonOptionArgs.get(0))) {
+            if (nonOptionArgs.isEmpty()) {
+                return;
+            }
+            if ("help".equalsIgnoreCase(nonOptionArgs.get(0))) {
                 printHelp();
                 return;
             }

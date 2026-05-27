@@ -1,3 +1,20 @@
 spring:
   main:
     banner-mode: "off"
+
+server:
+  port: 8080
+
+dbsync:
+  outputDir: "./dbsync"
+  diffTypes: "columns"
+  standard:
+    url: ""
+    username: ""
+    passwordEnv: "DBSYNC_STANDARD_PASSWORD"
+    schema: ""
+  production:
+    url: ""
+    username: ""
+    passwordEnv: "DBSYNC_PROD_PASSWORD"
+    schema: ""
